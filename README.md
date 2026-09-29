@@ -28,3 +28,45 @@ library components intended to be composed by an embedding application.
 ## Main packages
 
 `marine`, `cranes`, `yard`, `gate`, `customs`, `reefer`, `hazmat`, `equipment`, `rail`, `billing`, `transshipment`, `planning`, `persistence`, `reporting`, and `api`.
+
+## Restartable plan storage
+
+`persistence.RestartablePlanStore` gives plan aggregates an event-sourced,
+snapshot-backed lifetime that survives process restarts:
+
+```python
+from terminalweave.persistence import RestartablePlanStore, ActionContext
+
+store = RestartablePlanStore("./data/plans", snapshot_interval=25)
+
+def on_item(ctx: ActionContext):
+    # side-effecting business actions must be idempotent on ctx.key
+    external_system.schedule(ctx.payload["item_id"], idempotency_key=ctx.key)
+
+store.register_action("plan.item_added", on_item)
+
+result = store.create_plan("berth-7", "Night rotation")
+store.add_item("berth-7", result.version, "move-1", {"crane": "QC3"},
+               command_id="client-command-123")
+
+# after a restart: snapshot validated, missing events replayed, interrupted
+# actions redriven — completed actions never run twice
+for report in store.recover_all():
+    print(report.plan_id, report.recovered_sequence, report.snapshot_used)
+```
+
+Guarantees:
+
+- every plan change is an ordered, checksummed event appended to a per-plan
+  durable log (fsynced); an append passes the caller's expected sequence and a
+  stale version raises `ConflictError`, across threads *and* processes;
+- a `command_id` makes retries idempotent (a repeated command returns the
+  original event instead of appending a duplicate);
+- state snapshots are written periodically and atomically with a SHA-256
+  checksum; on recovery a missing, corrupt/truncated, or future-dated snapshot
+  is discarded or quarantined, state is rebuilt by replaying the event log,
+  and a fresh snapshot is taken;
+- business actions run at-least-once and are tracked in a durable action
+  ledger keyed by `plan_id:sequence`; repeated recoveries never re-execute
+  completed actions, including actions already folded into a snapshot.
+
